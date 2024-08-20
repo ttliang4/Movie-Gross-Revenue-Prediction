@@ -1,0 +1,656 @@
+---
+title: "Predicting the gross of top 1000 movies in IMDB"
+author: "Tingting Liang"
+date: "2024-03-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+subtitle: PSTAT 131 Final Project
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+![](images/clipboard-3414087308.png)
+
+In today's ever-evolving film industry, understanding the factors that influences a movie's success can be very crucial for film-makers, producers and movie investors. One key metric used to assess a film's success is its gross revenue, which not only reflects its financial success but also how well its been received by the general public. To predict a movie's revenue before its release can offer valuable insight for the decision making process, aiding in resource allocation and strategic planning.
+
+The aim of this project is to predict the gross revenue of films by analyzing the "IMDB Movies Dataset" from Kaggle. Using variables like genre, IMDB rating, runtime, certificate and other relevant factors to predict the gross revenue of movies. By analyzing these factors, we seek to identify patterns and correlations that contribute to a film's financial success. Consequently, providing potentially useful insights for industry professionals involved in film production, distribution, and investment.
+
+## Loading and Exploring the Raw Data
+
+Lets load the necessary packages and take a look at the raw IMDB data set. Then use the clean_names() function to clean up the variable names.
+```{r}
+# load packages
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(visdat)
+library(kknn)
+library(corrr)
+library(yardstick)
+library(ggplot2)
+library(corrplot)
+library(psych)
+library(discrim)
+library(themis)
+library(forcats)
+library(dplyr)
+library(xgboost)
+library(vip)
+
+# load data
+imdb_data = read_csv("data/imdb_top_1000.csv")
+set.seed(123)
+
+imdb_data %>%
+  head()
+
+# clean neame
+imdb_data <- imdb_data %>% 
+  clean_names()
+```
+
+## Data Tidying
+
+### Variable selection
+
+Let's first take a look at the dimension of our raw data.
+```{r}
+# check data dimension
+dim(imdb_data)
+```
+
+This data set contains 1000 rows and 16 columns. Which means we have 1000 movies and 16 variables. One variable `gross` is our response variable so the other 15 are predictor variables. But notice the naming and descriptive variables like `poster_link`, `series_title`, `overview`, `director`, and all the variables with star names aren't really relevant for predicting our outcome gross revenue, so we'll be dropping those columns.
+```{r}
+imdb <- imdb_data %>% 
+  select(-c("poster_link", "series_title", "overview", "director", "star1", "star2", "star3", "star4"))
+
+# check the dimension again
+dim(imdb)
+```
+
+This leaves us with a new data set of 1000 rows and 8 columns. This means we have 1000 movies and 8 variables in the data set. One being the outcome variable `gross`, so this leaves us with 7 predictor variables.
+
+
+
+Now let's take a look at the variable types we'll be working on and see if we need to make any necessary changes.
+```{r}
+sapply(imdb, class)
+```
+
+We have a data set with both categorical and numeric columns. The categorical columns are `released_year`, `certificate`, `runtime`, and `genre`. The numeric columns are `imdb_rating`, `meta_score`, `no_of_votes`, and `gross`. Notice variables `runtime` and `released_Year` contains numeral values but are inputted as categorical variables, it might be more helpful to use `runtime` and `released_Year` as numeric values to predict gross revenue, so let's covert them into numeric type.
+
+```{r}
+# Remove 'min' from runtime
+imdb$runtime <- gsub("min","",as.character(imdb$runtime))
+head(imdb$runtime)
+
+# convert runtime and released year to numeral type
+imdb$runtime <- as.numeric(imdb$runtime)
+class(imdb$runtime)
+
+imdb$released_year <- as.numeric(imdb$released_year)
+class(imdb$released_year)
+```
+
+
+### Tidying the Outcome variable
+
+Notice our outcome variable `gross` is quite large, lets change its unit to millions so it's easier to visualize and analyze.
+```{r}
+imdb['gross'] = imdb['gross']*(10**-6)
+head(imdb['gross'])
+```
+
+### Tidying the no_of_votes variable
+
+Notice the numbers in the `no_of_votes` variable is also very large, lets change its unit to thousands so it's easier to visualize and analyze.
+```{r}
+imdb['no_of_votes'] = imdb['no_of_votes']*(10**-3)
+head(imdb['no_of_votes'])
+```
+
+
+### Tidying the certificate variable
+
+Notice there are many classes of `certificate` in the data set and some types only have little values. Upon further inspection, it looks like different certificate systems are used, most film certificates are based on Central Board of Film Certification (CBFC) and fewer on Motion Picture Association film rating system (MPAA). Let's convert  all the certificate types to base on CBFC so it's consistent through out the dataset.
+
+All certificates are going to be group into 3 types (U, UA, A). `U` for unrestricted public exhibition, suitable for all ages. `UA` for unrestricted public exhibition but with parental guidance for under 12. And `A` for public exhibition to only adults (18+).
+```{r}
+# look at counts of each certificate type
+table(imdb$certificate)
+
+# change G, PG, GP, TV-PG to U
+imdb <- imdb %>%
+  mutate(certificate = recode(certificate, 
+                              'G'='U', 
+                              'PG'='U',
+                              'GP'='U',
+                              'TV-PG'='U'))
+                              
+# change U/A, 16, PG-13, TV-14, Approved, Passed to UA
+imdb <- imdb %>%
+  mutate(certificate = recode(certificate, 
+                              'U/A'='UA', 
+                              '16'='UA', 
+                              'PG-13'='UA', 
+                              'TV-14'='UA', 
+                              'Approved'='UA', 
+                              'Passed'='UA'))
+
+# change R, TV-MA to A
+imdb <- imdb %>%
+  mutate(certificate = recode(certificate, 
+                              'R'='A', 
+                              'TV-MA'='A',
+                              'Unrated'='A'))
+```
+
+
+### Tidying the genre variable
+
+Many movies contains more than one genre, to make our analysis easier let's extract the first genre listed and create a new column with just the primary genre and drop the genre column.
+
+```{r}
+imdb['primary_genre'] = str_split_i(imdb$genre, ', ', 1)
+imdb <- imdb %>% 
+  select(-c("genre"))
+
+head(imdb)
+```
+
+Our data set is now tidied, let's move on to the exploratory data analysis!
+
+# Exploratory Data Analysis
+
+## Missing data
+
+Let's see if we have any missing values in the data set that could cause issues later on.
+
+```{r}
+imdb %>%
+  vis_miss()
+```
+
+The plot shows that we have 5.3% of missing values in the entire data set. The missingness come from 3 variables, `certificate`, `meta_score` and `gross`. Since `gross` is the outcome variable we want to predict, let's remove all the rows with gross missing to reduce bias in our model. Since around 10-20% of data is missing for the other two variables, let's further explore those variables to see how we can fill in those missing values. 
+
+```{r}
+# remove missing gross rows
+imdb = imdb[!is.na(imdb$gross),]
+```
+
+### Released Year
+The released_year seem to have one missing value, let's find the movie title and fill in the released year. 
+```{r}
+sum(is.na(imdb$released_year))
+
+# Find the row of missing released_year
+which(is.na(imdb$released_year))
+
+# Find movie title
+imdb_data[804,]
+
+# fill in missing released year
+imdb$released_year[804] = 1995
+```
+
+### Meta score
+Meta score is defined by the weighted average of movie reviews of a large group of respected critics, and meta score only exist when a movie had been reviewed by at least 4 critics. So some movies are missing meta score because of the lack of critic reviews. Let's create a new column to indicate if there exist a meta score for the given movie and drop the` meta_score` column.
+
+```{r}
+# Creating new column to indicate whether a Meta score exists
+imdb['metascore_exists'] = !is.na(imdb['meta_score'])
+imdb <- imdb %>% 
+  select(-c("meta_score"))
+```
+
+### Certificate
+Movies are certified by its suitability for certain audience based on its content, so we can assume that movie certificate are related to the genre of the movie. Let's create a frequency table of certificate types based on the primary genre.
+```{r}
+# table of certificate frequency for each primary genre
+certificate_freq <- table(imdb$primary_genre, imdb$certificate)
+certificate_freq <- as.data.frame.matrix(certificate_freq)
+
+# mode for each genre
+mode_certificates <- apply(certificate_freq, 1, function(x) names(x)[which.max(x)])
+
+# dataframe of certificate counts and mode
+merged_data <- cbind(certificate_freq, Mode = mode_certificates)
+merged_data
+```
+
+Lets fill in the missing certificate with the mode based on its primary genre.
+```{r}
+for (i in 1:length(unique(imdb$primary_genre))) {
+  genre <- unique(imdb$primary_genre)[i]
+  mode_cert <- mode_certificates[i]
+  imdb$certificate[imdb$primary_genre == genre & is.na(imdb$certificate)] <- mode_cert
+}
+
+sum(is.na(imdb$certificate))
+```
+
+
+Now let's check if we have handled all the missing values in the data set.
+```{r}
+imdb %>%
+  vis_miss()
+```
+Now our dataset has no missing values. Let's look at the five point summary for the numeric variables.
+```{r}
+select_if(imdb, is.numeric) %>% describe()
+```
+After cleaning the data, we ended up with 831 movies and 8 variables. Our dataset contains 5 numeral variables and 3 categorical variables. Looks like the average gross revenue is around 68 million with 936 million as the maximum gross for a movie and 0 as minimum.
+
+## Data visualization
+First, we need to convert all the categorical variables to factors.
+```{r}
+# Changing categorical variables to factors
+imdb <- imdb %>%
+  mutate(certificate = factor(certificate), 
+        primary_genre = factor(primary_genre),
+        metascore_exists = factor(metascore_exists))
+```
+
+### Correlation Plot
+Let's explore the overall correlation between the continuous variables.
+```{r}
+imdb %>% 
+  select(is.numeric) %>% 
+  cor(use = "complete.obs") %>% 
+  corrplot(type = 'lower', diag = FALSE, 
+           method = 'circle')
+```
+
+There's strong positive correlation between variables `no_of_votes` and `imdb_rating`. It makes sense the movies that get more votes gets higher score in `imdb_rating`. There's also strong correlation between `gross` and `no_of_votes`. So movies that gets higher votes tend to do better in revenue. Which makes sense since higher votes means higher popularity, and we can assume that higher popularity in movies will do better in gross revenue. There's also positive correlation between movie `released_ year` and `gross`, so newer movies tend to get higher gross. This also makes sense since cinema prices increases overtime.
+
+### Gross revenue
+Let's explore the distribution of our outcome variable `gross`.
+```{r}
+# Distribution of gross revenue
+imdb %>% ggplot(aes(gross)) +
+  geom_histogram(fill='skyblue') +
+  labs(title = 'Distribution of Gross Revenue', 
+       x = 'Gross Revenue (in millions)'
+  )
+```
+
+The possible values of `gross` ranges 0 to 1000 million. The distribution of gross revenue is left-skewed, meaning most movie gross revenue lies in the lower range below 100 million and fewer movies gets over 250 million in revenue. 
+
+### Certificate
+We grouped the certificate types into 3 classes, "U", "UA", and "A". Let's take a look at it's relationship with gross revenue and see if certain certificate types have higher gross revenue than others.
+```{r}
+# Boxplot of Gross and Certificate
+imdb %>% 
+  ggplot(aes(x=gross, y=certificate, fill=certificate)) + 
+  geom_boxplot() + labs(title="Box Plot of Certificate vs. Gross", 
+                        y='Certificate',
+                        x='Gross Revenue (in millions)') 
+```
+
+The plot shows the quantiles and medians of gross revenues of different certificate types. It shows that the gross revenue of movies with UA certificate ranges the most and have a higher third quantile on average compare to the other certificate types. Most outliers also come from the UA rated movies. This makes sense since UA rating are suitable for a wider audience. 
+
+### Primary Genre and Gross
+Let's visualize the relationship between genre and gross revenue.
+```{r}
+# calculate gross revenue average for each primary genre 
+genre_mean <- aggregate(gross ~ primary_genre, imdb, mean)
+
+genre_mean %>% 
+  ggplot(aes(x=reorder(primary_genre, gross), y=gross, fill= primary_genre)) +  
+  geom_bar(stat="identity") + coord_flip( ) + 
+  labs(title="Primary Genre vs. Gross ", 
+       x = 'Primany Genre', 
+       y = 'Gross Revenue (in millions)') 
+```
+
+There is a total of 13 primary genres. On average the family genre gets the highest gross revenue, and the film-noir genre gets the lowest gross revenue. The top 3 genres are Family, Action and animation. The genres that tend to do worse in revenue is thriller, western and film-noir.
+
+### Released Years
+Let's visualize the relationship of `gross` and `released_year`.
+```{r}
+# calculate gross revenue average over time
+year_mean <- aggregate(gross ~ released_year, imdb, mean)
+
+year_mean %>%
+  ggplot(aes(x=released_year, y=gross)) +
+  geom_line(col='purple') +
+  labs(title="Average Gross Revenue over time", 
+       x="Released Year",
+       y="Gross Revenue (in millions)")
+```
+
+Gross revenue has fluctuated over the years but there's a clear upward trend. Which makes sense since cinema prices increases overtime and the filming industry/market is growing overtime. Notably, there's a significant spike around 1975 where revenue surpasses 150 million. However this peak is not replicated until recent years.
+
+# Model Building
+## Split data
+First, let's split the data into training and testing set. The training set is used for training our models and the testing set is used in the end to test how well our models predict the outcome variable on unseen data. I split the data into 70/30, 70% are used in training and 30% of the data are used for testing.
+```{r}
+set.seed(123)
+
+# split the data by 70% stratify on gross 
+imdb_split <- initial_split(imdb, prop = 0.70,
+                                strata = gross)
+imdb_train <- training(imdb_split)
+imdb_test <- testing(imdb_split)
+  
+imdb_split
+```
+
+## Write the recipe
+Let's create a universal recipe to use for all of our models. We will be using 7 predictors, `released_year`, `certificate`, `runtime`, `genre`, `imdb_rating`, `meta_score`, and `no_of_votes` to predict `gross`. We will make the categorical variables `certificate`, `genre` and `meta_score` into dummy variables. Since some variables contain only one value, I use the zero variance filter to filter out the variables that contain only a single value. Finally, we'll normalize all variables by centering and scaling. 
+```{r}
+# creating recipe
+imdb_recipe <- recipe(gross ~ ., data = imdb_train) %>% 
+  # dummy coding all nominal variables
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>%
+  # scaling
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+
+imdb_recipe %>%
+  prep() %>% 
+  bake(new_data = imdb_train) 
+```
+
+## K-fold Cross Validation
+We will create 10 folds for k-fold stratified cross validation. This means that the dataset is divided into 10 equally folds into validation sets with each fold being a testing set with the other k-1 folds being the training set for that fold. After each training-validation iteration, the average accuracy is taken from the testing set of each of the folds to evaluate the performance of the model. By using k-fold cross validation, we can get a more reliable and stable estimate of the model's performance to new unseen data. 
+
+We stratify on the outcome variable `gross` to ensure we fold the data proportionally.
+```{r}
+imdb_folds <- vfold_cv(imdb_train, v=10, strata = gross)
+```
+
+## Setting up models
+Now let's start setting up our models! We will be building five models, linear regression, k-nearest neighbors, elastic net, random forest and boosted tree. Since some models will take very long time to run, I will save each model result to avoid needing to rerun the models every time. After fitting the models I will evaluate their performances with Root Mean Squared Error (RMSE). RMSE measures how far the model's predictions are from the true values using Euclidian distance, it is one of the most commonly used metric for evaluating the performance of regression models. 
+
+Setting up models by specifying the model, setting up appropriate mode and engine, as well as the parameters we want to tune.
+```{r}
+# Linear Regression
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+# K-Nearest Neighbors Model
+knn_model <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression") 
+
+# Elastic Net
+# Tuning penalty and mixture
+en_spec <- linear_reg(penalty = tune(), 
+                           mixture = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression") 
+
+# Random Forest
+# Tuning mtry (number of predictors), trees, and min_n (number of minimum values in each node)
+rf_spec <- rand_forest(mtry = tune(), 
+                       trees = tune(), 
+                       min_n = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# Boosted tree
+# Tuning mtry (number of predictors), trees, and learning rate
+bt_spec <- boost_tree(mtry = tune(), 
+                           trees = tune(), 
+                           learn_rate = tune()) %>%
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+### Setting up workflow
+Let's set up the workflow for each model and add the model and the recipe.
+```{r}
+# Linear Regression
+lm_wflow <- workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(imdb_recipe)
+
+# K-Nearest Neighbors Model
+knn_wkflow <- workflow() %>% 
+  add_model(knn_model) %>% 
+  add_recipe(imdb_recipe)
+
+# Elastic net 
+en_workflow <- workflow() %>% 
+  add_recipe(imdb_recipe) %>% 
+  add_model(en_spec)
+
+# Random Forest
+rf_workflow <- workflow() %>% 
+  add_recipe(imdb_recipe) %>% 
+  add_model(rf_spec)
+
+# Boosted tree
+bt_workflow <- workflow() %>%
+  add_recipe(imdb_recipe) %>% 
+  add_model(bt_spec) 
+```
+
+### Tuning grid
+Let's create a tuning grid with the ranges for the parameters we wish to tune and the number of levels.
+```{r}
+# K-nearest neighbors
+knn_grid <- grid_regular(neighbors(range = c(1,10)),
+                         levels = 10)
+
+# Elastic Net
+en_grid <- grid_regular(penalty(), 
+                        mixture(range = c(0.5,1)), 
+                        levels = 10)
+
+# Random Forest
+rf_grid <- grid_regular(mtry(range = c(1, 6)), 
+                        trees(range = c(200,600)), 
+                        min_n(range = c(5,20)), 
+                        levels = 6)
+
+# Boosted Tree
+bt_grid <- grid_regular(mtry(range = c(1, 6)), 
+                        trees(range = c(200, 600)),
+                        learn_rate(range = c(-10, -1)),
+                        levels = 6)
+```
+
+### Fit all models to the folded data
+Let's fit all the models and tune the models with our tuning grid.
+```{r}
+# Linear Regression
+# requires no tuning
+lm_fit <- lm_wflow %>% 
+  fit_resamples(imdb_folds)
+```
+
+```{r, eval = FALSE}
+# KNN
+knn_tune_res <- tune_grid(
+  object = knn_wkflow, 
+  resamples = imdb_folds, 
+  grid = knn_grid
+)
+
+# Elastic Net
+en_tune_res <- tune_grid(
+  en_workflow,
+  resamples = imdb_folds,
+  grid = en_grid
+)
+
+# Random Forest
+rf_tune_res <- tune_grid(
+  rf_workflow,
+  resamples = imdb_folds,
+  grid = rf_grid
+)
+
+# Boosted Tree
+bt_tune_reg <- tune_grid(
+  bt_workflow, 
+  resamples = imdb_folds, 
+  grid = bt_grid
+)
+```
+
+### Save the models
+Save the model results so we don't need to rerun every time.
+```{r, eval=FALSE}
+# knn model
+save(knn_tune_res, file = "knn_tune_res.rda")
+
+# elastic net model
+save(en_tune_res, file = "en_tune_res.rda")
+
+# Random Forest model
+save(rf_tune_res, file = "rf_tune_res.rda")
+
+# Boosted tree model
+save(bt_tune_reg, file = "bt_tune_reg.rda")
+```
+
+### Load the models
+Load the models back in.
+```{r}
+# knn
+load("knn_tune_res.rda")
+
+# elastic net
+load("en_tune_res.rda")
+
+# random forest
+load("rf_tune_res.rda")
+
+# Boosted Tree
+load("bt_tune_reg.rda")
+```
+
+## Collect Metrics
+Let's select the best model for each model types we fitted using the RMSE metric. 
+```{r}
+# best linear regression model
+best_lm_imdb <- collect_metrics(lm_fit) %>% 
+  dplyr::slice(1)
+
+# best knn model
+best_knn_imdb <- show_best(knn_tune_res, metric = 'rmse', n=1)
+
+# best elastic model
+best_en_imdb <- show_best(en_tune_res, metric = "rmse", n=1)
+                    
+# best random forest model
+best_rf_imdb <- show_best(rf_tune_res, metric = "rmse", n=1)
+
+# best boosted tree model
+best_bt_imdb <- show_best(bt_tune_reg, metric = "rmse", n=1)
+```
+
+# Model results
+
+Now that we have fitted all our models, let's create a RMSE table to compare the model performances!
+```{r}
+# create a tibble of all models and their RMSE
+rmse_tibble <- tibble(Model = c("Linear Regression", "K Nearest Neighbors", "Elastic Net", "Random Forest", "Boosted Tree"), RMSE = c(best_lm_imdb$mean, best_knn_imdb$mean, best_en_imdb$mean, best_rf_imdb$mean, best_bt_imdb$mean))
+
+# arrange the RMSE from low to high
+rmse_tibble = rmse_tibble %>% arrange(RMSE)
+rmse_tibble
+```
+Overall the boosted model has the lowest RMSE on the cross-validation data, so we can conclude that the boosted tree model model had the best performance! It looks like the simpler models like linear regression and K nearest neighbors performed the worse, probably indicating our data is not linear.
+
+## Autoplots
+
+### K-nearest Neighbor 
+```{r}
+autoplot(knn_tune_res, metric = 'rmse') + theme_minimal()
+```
+
+From the plot we can see that as the number of neighbors increases, our model performance increases and the RMSE decreases. But even with 10 neighbors, the RMSE is still around 70. 
+
+### Elastic Net
+```{r}
+autoplot(en_tune_res, metric = 'rmse') + theme_minimal()
+```
+
+We tuned the elastic net model with penalty and mixture at 10 levels. From the plot, it looks like from higher range of penalty value tend to do better. For lower penalty, mid to lower-range of mixture tend to get lower RMSE and as penalty increases, lower mixture values tend to get decreasing RMSE and higher mixture value that's closer to 1 gets increasing RMSE. So it seems that lower values of mixture only perform better than higher values of mixture when the penalty term is very high.
+
+### Random Forest
+```{r}
+autoplot(rf_tune_res, metric = 'rmse') + theme_minimal()
+```
+
+For random forest, we tuned the minimal node size, number trees and number of randomly selected predictors. Since we have 7 predictors in total, I choose the range of mtry to be between 1 and 6 so not all predictors are used in the first split. This is to prevent all trees to have the same first split and keep the trees to be independent from one another. From the plot, it looks like the number of trees doesn't make much of a difference in the model performance. The minimal node size doesn't appear to have a huge effect on the performance but lower values of `min_n` appear to have slightly lower RMSE. The number of mtry appear to have a huge affect on model performance, higher number of predictor did significantly better.
+
+### Boosted Tree
+```{r}
+autoplot(bt_tune_reg, metric = 'rmse') + theme_minimal()
+```
+
+For the boosted tree, we tuned the minimal node size, number of trees and learning rate. At lower learning rate, the number of trees and mtry didn't make much of a difference in model performance. As learning rate increases, the RMSE significantly gets lower. Which means the model does better when it's learning faster. Higher number of trees performed better when the learning rate is at 0.0015 but has no effect when learning rate is at 0.1. At the learning rate of 0.0015, as the number of mtry increases, the RMSE decreases. But at learning rate of 0.1, as the mtry increases, the RMSE decreases slightly then increases slightly then goes back down.
+
+# Results From the Best Model
+So the boosted tree model performed the best out of the 5 models we built.
+```{r}
+best_bt_imdb
+```
+Boosted tree #103 with 3 predictors, 200 trees and 0.1 learning rate performed the best with an RMSE of 62.30871!
+
+## Fitting to Training Data
+
+Now, we will take the best performed model and fit it to the training set. This trains our model again on the entire training set. 
+```{r}
+final_bt_model <- finalize_workflow(bt_workflow, best_bt_imdb)
+final_bt_model <- fit(final_bt_model, 
+                        data = imdb_train)
+```
+
+## Fitting to Testing Data
+
+Now let's take out finalize model and fit it to the testing set to see how well our model performed on unseen data!
+```{r}
+# evaluate performance on testing
+final_bt_model_test <- augment(final_bt_model, imdb_test) %>% 
+  rmse(truth = gross, estimate = .pred)
+
+final_bt_model_test
+```
+Looks like our boosted tree model actually performed worse on the testing set than the cross-validation set with RMSE of 84.5!
+
+# Visualizing Final Model Performance
+
+```{r}
+# create a tibble of predicted and actual gross
+imdb_tibble <- predict(final_bt_model, new_data = imdb_test %>% select(-gross))
+imdb_tibble <- bind_cols(imdb_tibble, imdb_test %>% select(gross))
+
+imdb_tibble %>% 
+  ggplot(aes(x = gross, y =.pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color='red') +
+  coord_cartesian(ylim=c(0,400)) +
+  labs(title = "Predicted Values vs. Actual Values",
+       x="Observed", 
+       y="Predicted")
+```
+
+If our model predicted every observation accurately, the points would form a straight line. However, from the plot we can see that very few points fall on the line, especially when gross gets larger. That makes sense since we have very little data for when gross revenue goes over 250 million. It looks like our model didn't really performed well since many points didn't follow the line. 
+
+# Conclusion
+
+After fitting and analyzing 5 different types of models, the best model to predict gross revenue of movies is the boosted tree model. This is not surprising since boosted tree models tend to do good for a wide range of data types and tend to handle high-dimensional data well. However, this model still didn't perform well in predicting the gross revenue of movies. Overall, our model produces a higher RMSE on the testing set compared to the cross-validation set, this indicates that the model may not generalize as well to unseen data. It also suggests that the model might be over-fitting to the training data, it captures noise in the training data rather than the underlying pattern. 
+
+For future research, I would like to explore more predictors such as authors and directors to see how the popularity of these figures featured in film can affect its success. I believe the low correlation between the predictors used and `gross` might contribute to the model performance, since only number of votes have a significant correlation with `gross`. I would also like to explore more models and try out different modeling techniques. Although this model did not perform quite well, I still find this project very interesting. This was a great opportunity for me to build my machine learning modeling skills while gaining valuable insights about movies in general.
+
+
+# Sources
+The data set was taken from [Kaggle](https://www.kaggle.com/datasets/harshitshankhdhar/imdb-dataset-of-top-1000-movies-and-tv-shows), by user HARSHIT SHANKHDHAR. The data was extracted from the IMDB website.
+
+Information about certificate types were found on wikipedia. ([CBFC](https://en.wikipedia.org/wiki/Central_Board_of_Film_Certification),
+[MPAA Film](https://en.wikipedia.org/wiki/Motion_Picture_Association_film_rating_system) and [MPAA TV](https://en.wikipedia.org/wiki/TV_Parental_Guidelines))
+
